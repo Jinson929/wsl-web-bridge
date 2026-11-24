@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WSL Web Bridge</title>
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="statusDot"></span>
+      <h1>WSL Web Bridge</h1>
+    </div>
+    <span class="badge" id="workspaceBadge">未连接</span>
+  </header>
+
+  <section class="panel-card" id="configSection">
+    <div class="section-header">
+      <h2>连接与自动化配置</h2>
+      <button type="button" class="link-btn" id="toggleConfigBtn">收起</button>
+    </div>
+    <div id="configBody">
+      <label class="field">
+        <span>WSL Bridge 地址</span>
+        <input type="text" id="endpointInput" placeholder="http://127.0.0.1:18423" />
+      </label>
+      <label class="field">
+        <span>安全 Token</span>
+        <input type="password" id="tokenInput" placeholder="粘贴终端输出的 Bearer Token" />
+      </label>
+      <label class="field">
+        <span>自动化模式</span>
+        <select id="autoModeSelect">
+          <option value="l2_readonly">L2 只读自动闭环（@wsl-read 与只读命令自动执行回填）</option>
+          <option value="manual">L1 全手动模式（所有操作均需点击确认）</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>连续只读自动步数上限（0 = 不限制）</span>
+        <input type="text" id="maxAutoStepsInput" placeholder="0" />
+      </label>
+      <label class="field">
+        <span>额外只读命令白名单（逗号分隔，可选）</span>
+        <input type="text" id="extraReadOnlyInput" placeholder="例如: jq, fd, du, df, bat" />
+      </label>
+      <label class="check-field">
+        <input type="checkbox" id="autoSendManualCb" checked />
+        <span>手动点击确认执行后，自动回填结果并发送</span>
+      </label>
+      <div class="row-actions">
+        <button type="button" class="btn btn-primary" id="connectBtn">保存并连接</button>
+      </div>
+    </div>
+    <div class="status-msg" id="statusMsg"></div>
+  </section>
+
+  <section class="panel-card">
+    <h2>快捷注入到当前对话</h2>
+    <div class="quick-grid">
+      <button type="button" class="btn btn-secondary" id="injectProtocolBtn">注入协作协议提示词</button>
+      <button type="button" class="btn btn-secondary" id="injectGitDiffBtn">注入 Git Diff</button>
+    </div>
+  </section>
+
+  <section class="panel-card tree-card">
+    <div class="section-header">
+      <h2>WSL 项目文件树</h2>
+      <button type="button" class="link-btn" id="refreshTreeBtn">刷新</button>
+    </div>
+    <input type="text" class="search-input" id="filterInput" placeholder="全局搜索文件（支持空格分词，如 backend role）..." />
+    <div class="tree-container" id="treeContainer">
+      <div class="empty-hint">请先连接本地 WSL Bridge</div>
+    </div>
+  </section>
+
+  <footer class="footer-bar">
+    <span id="selectedCount">已选 0 个文件</span>
+    <div class="footer-actions">
+      <button type="button" class="btn btn-ghost" id="clearSelBtn">清空</button>
+      <button type="button" class="btn btn-primary" id="injectFilesBtn" disabled>注入选中文件</button>
+    </div>
+  </footer>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>

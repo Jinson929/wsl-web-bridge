@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "WSL Web Bridge",
+  "version": "3.0.0",
+  "description": "模型无关的本地 WSL 项目桥接扩展：在网页对话中安全浏览并注入 WSL 上下文，支持 L2 只读自动闭环、服务端行号切片、宽松补丁匹配与一键撤销修改。",
+  "permissions": [
+    "storage",
+    "sidePanel",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "打开 WSL Web Bridge 侧边栏"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://gemini.google.com/*",
+        "https://aistudio.google.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
