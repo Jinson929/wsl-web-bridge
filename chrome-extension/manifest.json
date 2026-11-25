@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "WSL Web Bridge",
-  "version": "3.0.0",
-  "description": "模型无关的本地 WSL 项目桥接扩展：在网页对话中安全浏览并注入 WSL 上下文，支持 L2 只读自动闭环、服务端行号切片、宽松补丁匹配与一键撤销修改。",
+  "version": "3.1.0",
+  "description": "模型无关的本地 WSL 项目桥接扩展：支持虚拟文件附件传输、L2 只读自动闭环、服务端行号切片、宽松补丁匹配与一键撤销修改。",
   "permissions": [
     "storage",
     "sidePanel",

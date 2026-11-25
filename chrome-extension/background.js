@@ -7,7 +7,10 @@ const DEFAULT_CONFIG = {
   autoMode: "l2_readonly",       // "manual" | "l2_readonly"
   autoSendAfterManual: true,     // Auto insert & send after user clicks manual Approve
   maxAutoSteps: 0,               // 0 = unlimited consecutive L2 read-only auto steps
-  extraReadOnlyBins: ""          // Comma-separated extra read-only commands
+  extraReadOnlyBins: "",         // Comma-separated extra read-only commands
+  transferMode: "auto_attach",   // "auto_attach" | "always_attach" | "text_only"
+  bundleMode: "single_bundle",   // "single_bundle" | "per_file"
+  attachThresholdChars: 4000     // Cmd/diff chars threshold to auto-upgrade to attachment
 };
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -23,16 +26,28 @@ async function getConfig() {
     "autoMode",
     "autoSendAfterManual",
     "maxAutoSteps",
-    "extraReadOnlyBins"
+    "extraReadOnlyBins",
+    "transferMode",
+    "bundleMode",
+    "attachThresholdChars"
   ]);
   const parsedMax = Number(stored.maxAutoSteps);
+  const parsedThreshold = Number(stored.attachThresholdChars);
+  const validTransferModes = new Set(["auto_attach", "always_attach", "text_only"]);
+  const validBundleModes = new Set(["single_bundle", "per_file"]);
   return {
     endpoint: (stored.endpoint || DEFAULT_CONFIG.endpoint).replace(/\/+$/, ""),
     token: (stored.token || "").trim(),
     autoMode: stored.autoMode === "manual" ? "manual" : "l2_readonly",
     autoSendAfterManual: stored.autoSendAfterManual !== undefined ? Boolean(stored.autoSendAfterManual) : DEFAULT_CONFIG.autoSendAfterManual,
     maxAutoSteps: Number.isInteger(parsedMax) && parsedMax >= 0 ? parsedMax : DEFAULT_CONFIG.maxAutoSteps,
-    extraReadOnlyBins: typeof stored.extraReadOnlyBins === "string" ? stored.extraReadOnlyBins : DEFAULT_CONFIG.extraReadOnlyBins
+    extraReadOnlyBins: typeof stored.extraReadOnlyBins === "string" ? stored.extraReadOnlyBins : DEFAULT_CONFIG.extraReadOnlyBins,
+    transferMode: validTransferModes.has(stored.transferMode) ? stored.transferMode : DEFAULT_CONFIG.transferMode,
+    bundleMode: validBundleModes.has(stored.bundleMode) ? stored.bundleMode : DEFAULT_CONFIG.bundleMode,
+    attachThresholdChars:
+      Number.isInteger(parsedThreshold) && parsedThreshold >= 500 && parsedThreshold <= 50000
+        ? parsedThreshold
+        : DEFAULT_CONFIG.attachThresholdChars
   };
 }
 
@@ -112,9 +127,34 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           maxAutoSteps = Number.isNaN(n) || n < 0 ? 0 : Math.min(100, n);
         }
         const extraReadOnlyBins = message.extraReadOnlyBins !== undefined ? String(message.extraReadOnlyBins).trim() : current.extraReadOnlyBins;
+        const validTransferModes = new Set(["auto_attach", "always_attach", "text_only"]);
+        const transferMode =
+          message.transferMode !== undefined && validTransferModes.has(message.transferMode)
+            ? message.transferMode
+            : current.transferMode;
+        const validBundleModes = new Set(["single_bundle", "per_file"]);
+        const bundleMode =
+          message.bundleMode !== undefined && validBundleModes.has(message.bundleMode)
+            ? message.bundleMode
+            : current.bundleMode;
+        let attachThresholdChars = current.attachThresholdChars;
+        if (message.attachThresholdChars !== undefined) {
+          const n = parseInt(String(message.attachThresholdChars), 10);
+          attachThresholdChars = Number.isNaN(n) ? DEFAULT_CONFIG.attachThresholdChars : Math.max(500, Math.min(50000, n));
+        }
 
         assertLocalEndpoint(endpoint);
-        await chrome.storage.local.set({ endpoint, token, autoMode, autoSendAfterManual, maxAutoSteps, extraReadOnlyBins });
+        await chrome.storage.local.set({
+          endpoint,
+          token,
+          autoMode,
+          autoSendAfterManual,
+          maxAutoSteps,
+          extraReadOnlyBins,
+          transferMode,
+          bundleMode,
+          attachThresholdChars
+        });
         sendResponse({ ok: true });
         return;
       }
@@ -138,6 +178,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const res = await chrome.tabs.sendMessage(tab.id, {
           type: "INSERT_CHAT_TEXT",
           text: message.text,
+          autoSend: Boolean(message.autoSend)
+        });
+        sendResponse({ ok: true, result: res });
+        return;
+      }
+
+      if (message.type === "INJECT_PAYLOAD_TO_TAB") {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab || !tab.id) {
+          throw new Error("未找到当前激活的浏览器标签页");
+        }
+        const res = await chrome.tabs.sendMessage(tab.id, {
+          type: "INSERT_CHAT_PAYLOAD",
+          payload: message.payload,
           autoSend: Boolean(message.autoSend)
         });
         sendResponse({ ok: true, result: res });

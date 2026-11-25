@@ -44,6 +44,25 @@
         <span>额外只读命令白名单（逗号分隔，可选）</span>
         <input type="text" id="extraReadOnlyInput" placeholder="例如: jq, fd, du, df, bat" />
       </label>
+      <label class="field">
+        <span>上下文传输通道</span>
+        <select id="transferModeSelect">
+          <option value="auto_attach">智能附件（源码走附件，短命令走对话，长输出自动转附件）</option>
+          <option value="always_attach">优先附件（源码、Diff 与命令结果尽量走附件）</option>
+          <option value="text_only">仅纯文本（传统对话框粘贴，用于网页改版降级）</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>多文件附件打包方式</span>
+        <select id="bundleModeSelect">
+          <option value="single_bundle">合并单文件上下文包（推荐，最稳定且不占附件数）</option>
+          <option value="per_file">每个文件独立附件（超过 8 个自动合并）</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>命令/Diff 自动转附件阈值（字符数）</span>
+        <input type="text" id="attachThresholdInput" placeholder="4000" />
+      </label>
       <label class="check-field">
         <input type="checkbox" id="autoSendManualCb" checked />
         <span>手动点击确认执行后，自动回填结果并发送</span>

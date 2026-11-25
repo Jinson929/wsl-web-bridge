@@ -5,6 +5,9 @@ const tokenInput = document.getElementById("tokenInput");
 const autoModeSelect = document.getElementById("autoModeSelect");
 const maxAutoStepsInput = document.getElementById("maxAutoStepsInput");
 const extraReadOnlyInput = document.getElementById("extraReadOnlyInput");
+const transferModeSelect = document.getElementById("transferModeSelect");
+const bundleModeSelect = document.getElementById("bundleModeSelect");
+const attachThresholdInput = document.getElementById("attachThresholdInput");
 const autoSendManualCb = document.getElementById("autoSendManualCb");
 const connectBtn = document.getElementById("connectBtn");
 const toggleConfigBtn = document.getElementById("toggleConfigBtn");
@@ -27,14 +30,14 @@ const expandedPaths = new Set();
 let searchTimer = null;
 let lastSearchQuery = "";
 
-const PROTOCOL_PROMPT = `我们现在通过 WSL Web Bridge (v3.0) 协作开发本地 WSL 项目。
-请使用以下代码块格式（L2 模式下，# @wsl-read 与只读白名单 # @wsl-cmd 会自动执行并回填发送；写入与补丁始终由我手动点击确认，且支持一键撤销）：
+const PROTOCOL_PROMPT = `我们现在通过 WSL Web Bridge (v3.1) 协作开发本地 WSL 项目。
+请使用以下代码块格式（L2 模式下，# @wsl-read 与只读白名单 # @wsl-cmd 会自动执行并回填发送；源码读取默认通过虚拟文件附件上传，对话框内仅保留轻量索引；写入与补丁始终由我手动点击确认，且支持一键撤销）：
 
-1. 批量读取文件（每行一个相对路径，建议每次 2-3 个或附带 :起始行-结束行）：
+1. 批量读取文件（每行一个相对路径，附件模式单轮可一次读 5-12 个文件，超大文件可用 :起始行-结束行 切片）：
 \`\`\`text
 # @wsl-read
-backend/src/app.py:1-120
-frontend-v5/src/index.ts:1-80
+backend/src/app.py
+frontend-v5/src/index.ts:1-180
 \`\`\`
 
 2. 执行 WSL 命令（保持精简单行，支持 cwd=子目录）：
@@ -306,6 +309,25 @@ async function loadWorkspace() {
   }
 }
 
+function makeTimeStampTag() {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+}
+
+function formatByteSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function sanitizeAttachmentName(relPath) {
+  const flat = String(relPath || "file")
+    .replace(/^\/+/, "")
+    .replace(/[^a-zA-Z0-9._-]+/g, "__");
+  return flat.endsWith(".txt") || flat.endsWith(".md") ? flat : `${flat}.txt`;
+}
+
 async function injectToChat(text, successLabel) {
   try {
     const res = await sendMsg({ type: "INJECT_TEXT_TO_TAB", text });
@@ -322,6 +344,30 @@ async function injectToChat(text, successLabel) {
   }
 }
 
+async function injectPayloadToChat(payload, successLabel) {
+  try {
+    const res = await sendMsg({ type: "INJECT_PAYLOAD_TO_TAB", payload, autoSend: false });
+    const r = res.result || {};
+    if (r.attachedCount > 0) {
+      setStatus(`${successLabel}（已挂载 ${r.attachedCount} 个附件）`, "success");
+    } else if (r.fallbackUsed) {
+      setStatus(`${successLabel}（附件未生效，已降级为文本注入）`, "success");
+    } else if (r.inserted) {
+      setStatus(successLabel, "success");
+    } else if (r.copiedToClipboard) {
+      setStatus(r.reason || "已复制到剪贴板，请 Ctrl+V 粘贴", "success");
+    } else {
+      setStatus("已发送到页面", "success");
+    }
+  } catch (err) {
+    const fallbackText = payload.fallbackText || payload.text || "";
+    if (fallbackText) {
+      await navigator.clipboard.writeText(fallbackText).catch(() => {});
+    }
+    setStatus(`未检测到已打开的聊天标签页，内容已复制到剪贴板 (${err.message})`, "error");
+  }
+}
+
 async function saveCurrentSettings(reconnect = false) {
   try {
     await sendMsg({
@@ -331,12 +377,15 @@ async function saveCurrentSettings(reconnect = false) {
       autoMode: autoModeSelect.value,
       maxAutoSteps: maxAutoStepsInput.value,
       extraReadOnlyBins: extraReadOnlyInput.value,
+      transferMode: transferModeSelect.value,
+      bundleMode: bundleModeSelect.value,
+      attachThresholdChars: attachThresholdInput.value,
       autoSendAfterManual: autoSendManualCb.checked
     });
     if (reconnect) {
       await loadWorkspace();
     } else {
-      setStatus("自动化设置已保存并立即生效", "success");
+      setStatus("自动化与传输设置已保存并立即生效", "success");
     }
   } catch (err) {
     setStatus(err.message, "error");
@@ -354,6 +403,9 @@ autoModeSelect.addEventListener("change", () => saveCurrentSettings(false));
 autoSendManualCb.addEventListener("change", () => saveCurrentSettings(false));
 maxAutoStepsInput.addEventListener("change", () => saveCurrentSettings(false));
 extraReadOnlyInput.addEventListener("change", () => saveCurrentSettings(false));
+transferModeSelect.addEventListener("change", () => saveCurrentSettings(false));
+bundleModeSelect.addEventListener("change", () => saveCurrentSettings(false));
+attachThresholdInput.addEventListener("change", () => saveCurrentSettings(false));
 
 refreshTreeBtn.addEventListener("click", loadWorkspace);
 
@@ -387,16 +439,49 @@ injectProtocolBtn.addEventListener("click", () => {
 injectGitDiffBtn.addEventListener("click", async () => {
   try {
     setStatus("正在读取 git status & diff...");
+    const cfgRes = await sendMsg({ type: "GET_CONFIG" });
+    const cfg = cfgRes.config || {};
     const res = await sendMsg({ type: "BRIDGE_REQUEST", method: "GET", path: "/api/git/diff" });
     const d = res.data;
-    const parts = ["以下是当前 WSL 仓库的 Git 状态与改动："];
-    if (d.status) parts.push(`\`\`\`text\n${d.status}\n\`\`\``);
+    const inlineParts = ["以下是当前 WSL 仓库的 Git 状态与改动："];
+    if (d.status) inlineParts.push(`\`\`\`text\n${d.status}\n\`\`\``);
     if (d.diff && d.diff.trim()) {
-      parts.push(`\`\`\`diff\n${d.diff.trim()}\n\`\`\``);
+      inlineParts.push(`\`\`\`diff\n${d.diff.trim()}\n\`\`\``);
     } else {
-      parts.push("（当前工作区无未暂存 Diff）");
+      inlineParts.push("（当前工作区无未暂存 Diff）");
     }
-    await injectToChat(parts.join("\n\n"), "已将 Git Diff 注入聊天输入框");
+    const inlineText = inlineParts.join("\n\n");
+    const threshold = cfg.attachThresholdChars || 4000;
+    const shouldAttach =
+      d.diff &&
+      d.diff.trim() &&
+      cfg.transferMode !== "text_only" &&
+      (cfg.transferMode === "always_attach" || inlineText.length > threshold);
+
+    if (shouldAttach) {
+      const filename = `wsl-git-diff-${makeTimeStampTag()}.txt`;
+      const bundleContent = [
+        "# WSL Git Status & Diff",
+        d.status ? `## git status\n${d.status}` : "",
+        `## git diff\n${d.diff.trim()}`
+      ].filter(Boolean).join("\n\n");
+      const summaryLines = [
+        `以下是当前 WSL 仓库的 Git 状态与改动（完整 Diff 已通过附件 \`${filename}\` 上传，${formatByteSize(bundleContent.length)}）：`
+      ];
+      if (d.status) {
+        summaryLines.push(`\`\`\`text\n${d.status}\n\`\`\``);
+      }
+      await injectPayloadToChat(
+        {
+          text: summaryLines.join("\n\n"),
+          fallbackText: inlineText,
+          files: [{ name: filename, content: bundleContent, mimeType: "text/plain" }]
+        },
+        "已将 Git Diff 注入聊天页面"
+      );
+    } else {
+      await injectToChat(inlineText, "已将 Git Diff 注入聊天输入框");
+    }
   } catch (err) {
     setStatus(err.message, "error");
   }
@@ -407,23 +492,95 @@ injectFilesBtn.addEventListener("click", async () => {
   if (!paths.length) return;
   try {
     setStatus(`正在读取 ${paths.length} 个文件...`);
+    const cfgRes = await sendMsg({ type: "GET_CONFIG" });
+    const cfg = cfgRes.config || {};
     const res = await sendMsg({
       type: "BRIDGE_REQUEST",
       method: "POST",
       path: "/api/read",
       body: { paths }
     });
-    const blocks = ["以下是来自我本地 WSL 项目的文件上下文："];
-    for (const f of res.data.files || []) {
+    const files = res.data.files || [];
+    const inlineBlocks = ["以下是来自我本地 WSL 项目的文件上下文："];
+    for (const f of files) {
       if (f.error) {
-        blocks.push(`### \`${f.path}\`\n> 读取跳过：${f.error}`);
+        inlineBlocks.push(`### \`${f.path}\`\n> 读取跳过：${f.error}`);
       } else {
         const ext = (f.path.split(".").pop() || "").toLowerCase();
         const truncNote = f.truncated ? " (内容过长已截断)" : "";
-        blocks.push(`### \`${f.path}\`${truncNote}\n\`\`\`${ext}\n${f.content}\n\`\`\``);
+        inlineBlocks.push(`### \`${f.path}\`${truncNote}\n\`\`\`${ext}\n${f.content}\n\`\`\``);
       }
     }
-    await injectToChat(blocks.join("\n\n"), `已将 ${paths.length} 个文件注入聊天输入框`);
+    const inlineText = inlineBlocks.join("\n\n");
+
+    const okFiles = files.filter((f) => !f.error);
+    if (cfg.transferMode === "text_only" || okFiles.length === 0) {
+      await injectToChat(inlineText, `已将 ${paths.length} 个文件注入聊天输入框`);
+      return;
+    }
+
+    const usePerFile = cfg.bundleMode === "per_file" && okFiles.length <= 8;
+    const attachFiles = [];
+    const indexLines = [];
+
+    if (usePerFile) {
+      for (const f of okFiles) {
+        const attachName = sanitizeAttachmentName(f.path);
+        const linesCount = f.totalLines || f.lines || (f.content || "").split(/\r?\n/).length;
+        const header = `// FILE: ${f.path} (共 ${linesCount} 行)\n\n`;
+        attachFiles.push({
+          name: attachName,
+          content: header + (f.content || ""),
+          mimeType: "text/plain"
+        });
+        indexLines.push(`- \`${f.path}\` (共 ${linesCount} 行) -> 附件 \`${attachName}\``);
+      }
+    } else {
+      const bundleName = `wsl-context-${makeTimeStampTag()}.txt`;
+      const bundleIndex = [];
+      const bundleSections = [];
+      okFiles.forEach((f, idx) => {
+        const linesCount = f.totalLines || f.lines || (f.content || "").split(/\r?\n/).length;
+        const truncNote = f.truncated ? " [truncated]" : "";
+        bundleIndex.push(`${idx + 1}. ${f.path} (lines 1-${linesCount} / ${linesCount})${truncNote}`);
+        bundleSections.push(
+          `================================================================================\n` +
+          `FILE: ${f.path} (lines 1-${linesCount} / ${linesCount})${truncNote}\n` +
+          `================================================================================\n` +
+          (f.content || "")
+        );
+        indexLines.push(`- \`${f.path}\` (共 ${linesCount} 行)${f.truncated ? " [已截断]" : ""}`);
+      });
+      const bundleContent =
+        `# WSL Web Bridge Context Bundle\n` +
+        `Files: ${okFiles.length}\n\n` +
+        `## Index\n${bundleIndex.join("\n")}\n\n` +
+        bundleSections.join("\n\n");
+      attachFiles.push({ name: bundleName, content: bundleContent, mimeType: "text/plain" });
+    }
+
+    for (const f of files) {
+      if (f.error) {
+        indexLines.push(`- \`${f.path}\` [读取跳过: ${f.error}]`);
+      }
+    }
+
+    const totalBytes = attachFiles.reduce((acc, f) => acc + (f.content ? f.content.length : 0), 0);
+    const attachNamesText = attachFiles.map((f) => `\`${f.name}\``).join("、");
+    const summaryText = [
+      `以下是来自我本地 WSL 项目的源码上下文（已通过附件 ${attachNamesText} 上传，共 ${okFiles.length} 个文件 / ${formatByteSize(totalBytes)}）：`,
+      ...indexLines,
+      "请直接结合附件中的源码进行分析。"
+    ].join("\n");
+
+    await injectPayloadToChat(
+      {
+        text: summaryText,
+        fallbackText: inlineText,
+        files: attachFiles
+      },
+      `已将 ${paths.length} 个文件注入聊天页面`
+    );
   } catch (err) {
     setStatus(err.message, "error");
   }
@@ -437,6 +594,9 @@ injectFilesBtn.addEventListener("click", async () => {
     autoModeSelect.value = res.config.autoMode || "l2_readonly";
     maxAutoStepsInput.value = String(res.config.maxAutoSteps ?? 0);
     extraReadOnlyInput.value = res.config.extraReadOnlyBins || "";
+    transferModeSelect.value = res.config.transferMode || "auto_attach";
+    bundleModeSelect.value = res.config.bundleMode || "single_bundle";
+    attachThresholdInput.value = String(res.config.attachThresholdChars ?? 4000);
     autoSendManualCb.checked = res.config.autoSendAfterManual !== false;
     if (res.config.token) {
       await loadWorkspace();

@@ -4,20 +4,20 @@ description: Collaborate on local WSL projects through the WSL Web Bridge browse
 ---
 # WSL Bridge
 
-Model-agnostic protocol for collaborating on local WSL codebases from web chat via the WSL Web Bridge Chrome/Edge extension (v3.0).
+Model-agnostic protocol for collaborating on local WSL codebases from web chat via the WSL Web Bridge Chrome/Edge extension (v3.1).
 
 ## When to Use
 
 - The user wants to read, search, modify, or test files in a local WSL project from browser chat.
-- The user pastes `[WSL 文件读取结果]`, `[WSL 命令执行结果]`, `[WSL 文件写入完成]`, or `[WSL 补丁已应用]` feedback.
+- The user pastes `[WSL 文件读取结果]`, `[WSL 命令执行结果]`, `[WSL 文件写入完成]`, or `[WSL 补丁已应用]` feedback (including virtual file attachments such as `wsl-read-*.txt` or `wsl-cmd-*.txt`).
 - The user asks to work on a local WSL workspace without cloning it to a cloud repo.
 
 ## Workflow
 
 1. Inspect before editing. Prefer read-only blocks (`# @wsl-read` and allowlisted read-only `# @wsl-cmd`) first so the extension's L2 read-only auto-loop can gather context automatically.
-2. Keep each `# @wsl-read` batch small (at most 2 to 3 files per turn, or use `path:start-end` server-side line ranges) so payloads stay fast and concise. For large files, locate target line numbers with `rg -n` or `grep -n` first, then read only the relevant slice.
+2. Dual-channel transfer: in v3.1 default attachment mode, `# @wsl-read` and oversized command/diff outputs are uploaded as virtual `.txt` file attachments while the chat bubble keeps only a concise file index. You may batch up to 8 to 12 medium source files in a single `# @wsl-read` block (within ~512 KB total) instead of splitting into tiny turns; for huge files, locate lines with `rg -n` / `grep -n` first and read `path:start-end` slices. If the user is in `text_only` fallback mode, keep batches to 2 to 3 files.
 3. Emit at most one focused read/diagnostic block per turn when waiting on exploration output; when ready to apply coordinated multi-file edits, you may emit the edit cards together (the extension accumulates results across cards and offers one-click sequential batch execution plus per-card Undo).
-4. Propose targeted edits using `# @wsl-patch:` for existing files (Go v3.0 supports exact + line-normalized tolerant matching) and `# @wsl-write:` only for new files or complete rewrites.
+4. Propose targeted edits using `# @wsl-patch:` for existing files (Go v3.0+ supports exact + line-normalized tolerant matching) and `# @wsl-write:` only for new files or complete rewrites.
 5. After edits are applied, follow up with a concise verification command (syntax check, unit test, build, or `git diff`).
 
 ## Protocol Formats
@@ -74,8 +74,8 @@ Use `# @wsl-diff` followed by a standard `git diff` patch when updating multiple
 
 ## Gotchas
 
-- Never request 5 or more full files in a single `# @wsl-read` block. Split reads into 2 to 3 files per turn or use `path:start-end` line ranges.
-- Keep `# @wsl-cmd` commands concise and single-line (roughly 100 characters or fewer).
+- In attachment mode, keep each `# @wsl-read` batch within roughly 8 to 12 medium files (max 25 paths / ~512 KB bundle budget) and use `path:start-end` slices for very large files; in `text_only` fallback mode, keep batches to 2 to 3 files.
+- Keep `# @wsl-cmd` commands concise and single-line (roughly 100 characters or fewer). Short command output stays inline; long output auto-upgrades to an attachment.
 - Keep `# @wsl-patch` `SEARCH` blocks minimal (only enough unique surrounding lines to match once).
 - Never chain a read command with a mutating command in the same `# @wsl-cmd` block.
 - Never use absolute paths or `../` paths. All paths must be relative to the bridge workspace root.

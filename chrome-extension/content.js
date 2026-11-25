@@ -1,5 +1,6 @@
-// WSL Web Bridge - Content Script (v3.0.0)
+// WSL Web Bridge - Content Script (v3.1.0)
 // Features:
+// - Dual-channel delivery: virtual file attachments for source code / large outputs, inline text for short commands
 // - Server-side line-range /api/read (with client-side fallback for older bridges)
 // - One-click Undo Snapshot button on /api/write and /api/patch cards
 // - Multi-card accumulation & sequential batch execution bar
@@ -9,15 +10,20 @@
   const PROCESSED_ATTR = "data-wslb-bound";
   const MAX_CHAT_INSERT_CHARS = 24000;
   const MAX_PER_FILE_CHARS = 8000;
+  const MAX_ATTACH_BUNDLE_CHARS = 512 * 1024;
   let consecutiveAutoSteps = 0;
   let autoLoopPaused = false;
   let sawLiveStream = false;
   let autoArmedForNextScan = false;
+  let chatDeliveryQueue = Promise.resolve();
   let cachedConfig = {
     autoMode: "l2_readonly",
     autoSendAfterManual: true,
     maxAutoSteps: 0,
-    extraReadOnlyBins: ""
+    extraReadOnlyBins: "",
+    transferMode: "auto_attach",
+    bundleMode: "single_bundle",
+    attachThresholdChars: 4000
   };
 
   const cardExecutors = new WeakMap();
@@ -283,15 +289,220 @@
     return false;
   }
 
+  function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function makeTimeStampTag() {
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  }
+
+  function formatByteSize(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  }
+
+  function sanitizeAttachmentName(relPath) {
+    const flat = String(relPath || "file")
+      .replace(/^\/+/, "")
+      .replace(/[^a-zA-Z0-9._-]+/g, "__");
+    return flat.endsWith(".txt") || flat.endsWith(".md") ? flat : `${flat}.txt`;
+  }
+
   function clampChatPayload(text) {
     if (text.length <= MAX_CHAT_INSERT_CHARS) return text;
     return (
       text.slice(0, MAX_CHAT_INSERT_CHARS) +
-      `\n\n... [内容总长 ${text.length} 字符，为防止浏览器输入框卡死已截断至 ${MAX_CHAT_INSERT_CHARS} 字符；请拆分请求或使用 \`路径:起始行-结束行\` 分段读取]`
+      `\n\n... [内容总长 ${text.length} 字符，为防止浏览器输入框卡死已截断至 ${MAX_CHAT_INSERT_CHARS} 字符；请开启附件传输或使用 \`路径:起始行-结束行\` 分段读取]`
     );
   }
 
-  function insertTextIntoChat(rawText, autoSend = false) {
+  function getComposerRoot(input) {
+    if (!input) return document.body;
+    const known = input.closest(
+      "input-container, .input-area-container, .text-input-field, form, fieldset, footer, ms-prompt-input-wrapper, .prompt-input-wrapper"
+    );
+    if (known) return known;
+    let cur = input;
+    for (let i = 0; i < 6 && cur && cur.parentElement && cur.parentElement !== document.body; i++) {
+      cur = cur.parentElement;
+    }
+    return cur || document.body;
+  }
+
+  function getAttachmentSnapshot(composerRoot) {
+    const root = composerRoot || document.body;
+    const chipSelectors = [
+      "uploader-file-preview",
+      "file-preview",
+      "ms-file-chip",
+      "[data-test-id*='file-preview']",
+      "[data-test-id*='attachment']",
+      "[class*='file-preview']",
+      "[class*='attachment-preview']",
+      "mat-chip",
+      "mat-chip-row",
+      "button[aria-label*='Remove']",
+      "button[aria-label*='移除']",
+      "button[aria-label*='删除']"
+    ].join(", ");
+    const chipCount = root.querySelectorAll(chipSelectors).length;
+    const text = (root.innerText || "").slice(0, 8000);
+    return { chipCount, text };
+  }
+
+  function hasAttachmentAppeared(composerRoot, beforeSnap, expectedNames) {
+    const afterSnap = getAttachmentSnapshot(composerRoot);
+    if (afterSnap.chipCount > beforeSnap.chipCount) return true;
+    for (const name of expectedNames) {
+      if (!name) continue;
+      const base = name.replace(/\.txt$/i, "");
+      const inAfter = afterSnap.text.includes(name) || (base.length >= 8 && afterSnap.text.includes(base));
+      const inBefore = beforeSnap.text.includes(name) || (base.length >= 8 && beforeSnap.text.includes(base));
+      if (inAfter && !inBefore) return true;
+    }
+    return false;
+  }
+
+  function hasActiveUploadSpinner(composerRoot) {
+    const root = composerRoot || document.body;
+    const spinners = root.querySelectorAll(
+      "mat-progress-spinner, mat-progress-bar, [role='progressbar'], [aria-busy='true'], .uploading, .upload-progress"
+    );
+    for (const el of spinners) {
+      if (el.offsetParent !== null) return true;
+    }
+    return false;
+  }
+
+  async function waitForAttachmentMount(composerRoot, beforeSnap, expectedNames, timeoutMs = 900) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (hasAttachmentAppeared(composerRoot, beforeSnap, expectedNames)) {
+        return true;
+      }
+      await delay(100);
+    }
+    return hasAttachmentAppeared(composerRoot, beforeSnap, expectedNames);
+  }
+
+  async function waitForUploadsReadyAndSend(composerRoot, timeoutMs = 15000) {
+    const deadline = Date.now() + timeoutMs;
+    // Brief initial wait so Angular/React renders upload progress indicators
+    await delay(350);
+    while (Date.now() < deadline) {
+      const uploading = hasActiveUploadSpinner(composerRoot);
+      const sendBtn = findSendButton();
+      if (!uploading && sendBtn) {
+        await delay(220);
+        if (!hasActiveUploadSpinner(composerRoot)) {
+          return triggerSendChat();
+        }
+      }
+      await delay(220);
+    }
+    return triggerSendChat();
+  }
+
+  function findBestFileInput(composerRoot) {
+    const scopes = [composerRoot, document].filter(Boolean);
+    for (const scope of scopes) {
+      const inputs = Array.from(scope.querySelectorAll('input[type="file"]'));
+      if (!inputs.length) continue;
+      const preferred = inputs.find((el) => {
+        const accept = (el.getAttribute("accept") || "").toLowerCase();
+        return !accept || accept.includes("text") || accept.includes(".txt") || accept.includes("*/*");
+      });
+      if (preferred) return preferred;
+      return inputs[0];
+    }
+    return null;
+  }
+
+  async function attachFilesToChat(fileSpecs) {
+    if (!fileSpecs || !fileSpecs.length) {
+      return { attached: false, attachedCount: 0, method: "none" };
+    }
+    const input = findChatInput();
+    if (!input) {
+      return { attached: false, attachedCount: 0, method: "no_input" };
+    }
+
+    const composerRoot = getComposerRoot(input);
+    const expectedNames = fileSpecs.map((f) => f.name);
+    const makeDataTransfer = () => {
+      const dt = new DataTransfer();
+      for (const spec of fileSpecs) {
+        const fileObj = new File([spec.content || ""], spec.name, {
+          type: spec.mimeType || "text/plain"
+        });
+        dt.items.add(fileObj);
+      }
+      return dt;
+    };
+
+    // Tier 1: Synthetic ClipboardEvent("paste") with File items only
+    try {
+      const beforeSnap = getAttachmentSnapshot(composerRoot);
+      input.focus();
+      const dt = makeDataTransfer();
+      const pasteEvt = new ClipboardEvent("paste", {
+        clipboardData: dt,
+        bubbles: true,
+        cancelable: true
+      });
+      input.dispatchEvent(pasteEvt);
+      if (await waitForAttachmentMount(composerRoot, beforeSnap, expectedNames, 750)) {
+        return { attached: true, attachedCount: fileSpecs.length, method: "paste" };
+      }
+    } catch {
+      // Proceed to Tier 2
+    }
+
+    // Tier 2: Synthetic DragEvent("drop") on composer / input
+    try {
+      const beforeSnap = getAttachmentSnapshot(composerRoot);
+      const dropTarget = composerRoot || input;
+      const dt = makeDataTransfer();
+      for (const evtName of ["dragenter", "dragover", "drop"]) {
+        const dragEvt = new DragEvent(evtName, {
+          dataTransfer: dt,
+          bubbles: true,
+          cancelable: true
+        });
+        dropTarget.dispatchEvent(dragEvt);
+      }
+      if (await waitForAttachmentMount(composerRoot, beforeSnap, expectedNames, 750)) {
+        return { attached: true, attachedCount: fileSpecs.length, method: "drop" };
+      }
+    } catch {
+      // Proceed to Tier 3
+    }
+
+    // Tier 3: Direct <input type="file"> injection
+    try {
+      const fileInput = findBestFileInput(composerRoot);
+      if (fileInput) {
+        const beforeSnap = getAttachmentSnapshot(composerRoot);
+        const dt = makeDataTransfer();
+        fileInput.files = dt.files;
+        fileInput.dispatchEvent(new Event("input", { bubbles: true }));
+        fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+        if (await waitForAttachmentMount(composerRoot, beforeSnap, expectedNames, 900)) {
+          return { attached: true, attachedCount: fileSpecs.length, method: "file_input" };
+        }
+      }
+    } catch {
+      // Fall through to text fallback
+    }
+
+    return { attached: false, attachedCount: 0, method: "failed" };
+  }
+
+  async function insertTextIntoChat(rawText, autoSend = false) {
     const text = clampChatPayload(rawText || "");
     const input = findChatInput();
     if (!input) {
@@ -329,7 +540,10 @@
             cancelable: true
           });
           input.dispatchEvent(pasteEvt);
-          if ((input.innerText || "").length > existingText.length + 10) {
+          // Wait for Quill/React async paste handler before checking DOM to avoid double-paste
+          await delay(80);
+          const afterLen = (input.innerText || "").length;
+          if (pasteEvt.defaultPrevented || afterLen > existingText.length + Math.min(20, text.length / 2)) {
             inserted = true;
           }
         } catch {
@@ -347,12 +561,55 @@
     }
 
     if (autoSend) {
-      setTimeout(() => {
-        triggerSendChat();
-      }, 320);
+      await delay(320);
+      triggerSendChat();
     }
 
     return { inserted: true, autoSent: Boolean(autoSend) };
+  }
+
+  function deliverPayloadToChat(payload, autoSend = false) {
+    const run = async () => {
+      const input = findChatInput();
+      const composerRoot = getComposerRoot(input);
+      const files = Array.isArray(payload.files) ? payload.files : [];
+
+      if (files.length > 0) {
+        const attachRes = await attachFilesToChat(files);
+        if (attachRes.attached) {
+          const textRes = await insertTextIntoChat(payload.text || "", false);
+          if (autoSend) {
+            await waitForUploadsReadyAndSend(composerRoot);
+          }
+          return {
+            inserted: textRes.inserted,
+            attachedCount: attachRes.attachedCount,
+            attachMethod: attachRes.method,
+            autoSent: Boolean(autoSend),
+            fallbackUsed: false
+          };
+        }
+        // Attachment failed -> safe fallback to clamped inline text
+        const fallbackBody = payload.fallbackText || payload.text || "";
+        const textRes = await insertTextIntoChat(fallbackBody, autoSend);
+        return {
+          ...textRes,
+          attachedCount: 0,
+          fallbackUsed: true
+        };
+      }
+
+      const textRes = await insertTextIntoChat(payload.text || "", autoSend);
+      return {
+        ...textRes,
+        attachedCount: 0,
+        fallbackUsed: false
+      };
+    };
+
+    const next = chatDeliveryQueue.then(run, run);
+    chatDeliveryQueue = next.catch(() => {});
+    return next;
   }
 
   document.addEventListener("keydown", (e) => {
@@ -363,8 +620,16 @@
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message.type === "INSERT_CHAT_TEXT") {
-      const result = insertTextIntoChat(message.text || "", Boolean(message.autoSend));
-      sendResponse(result);
+      deliverPayloadToChat({ text: message.text || "" }, Boolean(message.autoSend))
+        .then((result) => sendResponse(result))
+        .catch((err) => sendResponse({ inserted: false, error: err.message }));
+      return true;
+    }
+    if (message.type === "INSERT_CHAT_PAYLOAD") {
+      deliverPayloadToChat(message.payload || { text: "" }, Boolean(message.autoSend))
+        .then((result) => sendResponse(result))
+        .catch((err) => sendResponse({ inserted: false, error: err.message }));
+      return true;
     }
   });
 
@@ -492,7 +757,43 @@
     return null;
   }
 
-  function formatResultForChat(action, data) {
+  function normalizeReadFileEntry(f, spec) {
+    if (f.error) {
+      return { path: f.path, error: f.error };
+    }
+    let content = f.content || "";
+    let totalLines = f.totalLines || content.split(/\r?\n/).length;
+    let startLine = f.startLine || 1;
+    let endLine = f.endLine || totalLines;
+    let sliced = Boolean(f.sliced);
+
+    if (!sliced && spec && spec.start !== null) {
+      const allLines = content.split(/\r?\n/);
+      totalLines = allLines.length;
+      startLine = spec.start;
+      endLine = Math.min(spec.end, totalLines);
+      content = allLines.slice(startLine - 1, endLine).join("\n");
+      sliced = true;
+    }
+
+    const rangeLabel = sliced
+      ? `第 ${startLine}-${endLine} 行 / 共 ${totalLines} 行`
+      : `共 ${totalLines} 行`;
+    const asciiRange = `lines ${startLine}-${endLine} / ${totalLines}`;
+    return {
+      path: f.path,
+      content,
+      totalLines,
+      startLine,
+      endLine,
+      sliced,
+      truncated: Boolean(f.truncated),
+      rangeLabel,
+      asciiRange
+    };
+  }
+
+  function formatInlineResultForChat(action, data) {
     if (action.kind === "read") {
       const specs = action.specs || [];
       const files = data.files || [];
@@ -500,36 +801,25 @@
       const blocks = ["[WSL 文件读取结果]"];
 
       files.forEach((f, idx) => {
-        if (f.error) {
-          blocks.push(`### \`${f.path}\`\n> 读取跳过：${f.error}`);
+        const norm = normalizeReadFileEntry(f, specs[idx] || { start: null, end: null });
+        if (norm.error) {
+          blocks.push(`### \`${norm.path}\`\n> 读取跳过：${norm.error}`);
           return;
         }
-        const spec = specs[idx] || { start: null, end: null };
-        const ext = (f.path.split(".").pop() || "").toLowerCase();
-
-        let displayContent = f.content || "";
-        let totalLines = f.totalLines || displayContent.split(/\r?\n/).length;
-        let headerNote = ` (共 ${totalLines} 行)`;
-
-        if (f.sliced) {
-          headerNote = ` (第 ${f.startLine}-${f.endLine} 行 / 共 ${totalLines} 行)`;
-        } else if (spec.start !== null) {
-          const allLines = displayContent.split(/\r?\n/);
-          totalLines = allLines.length;
-          displayContent = allLines.slice(spec.start - 1, spec.end).join("\n");
-          headerNote = ` (第 ${spec.start}-${Math.min(spec.end, totalLines)} 行 / 共 ${totalLines} 行)`;
-        }
+        const ext = (norm.path.split(".").pop() || "").toLowerCase();
+        let displayContent = norm.content;
+        let headerNote = ` (${norm.rangeLabel})`;
 
         if (displayContent.length > perFileBudget) {
           const shownLines = displayContent.slice(0, perFileBudget).split(/\r?\n/).length;
-          const nextStart = (f.sliced ? f.startLine : 1) + shownLines;
+          const nextStart = norm.startLine + shownLines;
           displayContent =
             displayContent.slice(0, perFileBudget) +
-            `\n... [已按防卡顿配额截断，仅展示前约 ${shownLines} 行；如需后续请用 \`${f.path}:${nextStart}-${Math.min(totalLines, nextStart + 150)}\` 分段读取]`;
+            `\n... [已按防卡顿配额截断，仅展示前约 ${shownLines} 行；如需后续请用 \`${norm.path}:${nextStart}-${Math.min(norm.totalLines, nextStart + 150)}\` 分段读取]`;
           headerNote += " [已截断]";
         }
 
-        blocks.push(`### \`${f.path}\`${headerNote}\n\`\`\`${ext}\n${displayContent}\n\`\`\``);
+        blocks.push(`### \`${norm.path}\`${headerNote}\n\`\`\`${ext}\n${displayContent}\n\`\`\``);
       });
 
       return clampChatPayload(blocks.join("\n\n"));
@@ -564,6 +854,160 @@
       out.push(`\`\`\`diff\n${data.diff.trim()}\n\`\`\``);
     }
     return clampChatPayload(out.join("\n"));
+  }
+
+  function buildChatPayload(action, data, cfg = cachedConfig) {
+    const transferMode = (cfg && cfg.transferMode) || "auto_attach";
+    const bundleMode = (cfg && cfg.bundleMode) || "single_bundle";
+    const threshold = (cfg && cfg.attachThresholdChars) || 4000;
+    const fallbackText = formatInlineResultForChat(action, data);
+
+    if (transferMode === "text_only") {
+      return { text: fallbackText, fallbackText, files: [] };
+    }
+
+    if (action.kind === "read") {
+      const specs = action.specs || [];
+      const entries = (data.files || []).map((f, idx) =>
+        normalizeReadFileEntry(f, specs[idx] || { start: null, end: null })
+      );
+      const okEntries = entries.filter((e) => !e.error);
+      if (okEntries.length === 0) {
+        return { text: fallbackText, fallbackText, files: [] };
+      }
+
+      const usePerFile = bundleMode === "per_file" && okEntries.length <= 8;
+      const attachFiles = [];
+      const summaryLines = [];
+
+      if (usePerFile) {
+        for (const e of okEntries) {
+          const attachName = sanitizeAttachmentName(e.path);
+          let body = e.content;
+          let truncMark = e.truncated ? " [已截断]" : "";
+          if (body.length > MAX_ATTACH_BUNDLE_CHARS) {
+            body = body.slice(0, MAX_ATTACH_BUNDLE_CHARS) + "\n... [超出单附件上限已截断]";
+            truncMark = " [已截断]";
+          }
+          const fileHeader = `// FILE: ${e.path} (${e.asciiRange})\n\n`;
+          attachFiles.push({
+            name: attachName,
+            content: fileHeader + body,
+            mimeType: "text/plain"
+          });
+          summaryLines.push(`- \`${e.path}\` (${e.rangeLabel})${truncMark} -> 附件 \`${attachName}\``);
+        }
+      } else {
+        const bundleName = `wsl-read-${makeTimeStampTag()}.txt`;
+        const bundleIndex = [];
+        const bundleSections = [];
+        let usedChars = 0;
+
+        okEntries.forEach((e, idx) => {
+          let body = e.content;
+          let truncMark = e.truncated ? " [已截断]" : "";
+          const remainingBudget = MAX_ATTACH_BUNDLE_CHARS - usedChars;
+          if (remainingBudget <= 512) {
+            summaryLines.push(`- \`${e.path}\` [超出附件总配额未打包，请单独切片读取]`);
+            return;
+          }
+          if (body.length > remainingBudget) {
+            body = body.slice(0, remainingBudget) + "\n... [超出附件总配额已截断，请使用 路径:起始行-结束行 分段读取]";
+            truncMark = " [已截断]";
+          }
+          usedChars += body.length;
+          bundleIndex.push(`${idx + 1}. ${e.path} (${e.asciiRange})${truncMark}`);
+          bundleSections.push(
+            `================================================================================\n` +
+            `FILE: ${e.path} (${e.asciiRange})${truncMark}\n` +
+            `================================================================================\n` +
+            body
+          );
+          summaryLines.push(`- \`${e.path}\` (${e.rangeLabel})${truncMark}`);
+        });
+
+        const bundleContent =
+          `# WSL Web Bridge Read Bundle\n` +
+          `Files: ${bundleSections.length}\n\n` +
+          `## Index\n${bundleIndex.join("\n")}\n\n` +
+          bundleSections.join("\n\n");
+        attachFiles.push({ name: bundleName, content: bundleContent, mimeType: "text/plain" });
+      }
+
+      for (const e of entries) {
+        if (e.error) {
+          summaryLines.push(`- \`${e.path}\` [读取跳过: ${e.error}]`);
+        }
+      }
+
+      const totalBytes = attachFiles.reduce((acc, f) => acc + f.content.length, 0);
+      const namesDesc = attachFiles.map((f) => `\`${f.name}\``).join("、");
+      const text = [
+        `[WSL 文件读取结果] 已通过附件 ${namesDesc} 上传（${okEntries.length} 个文件，${formatByteSize(totalBytes)}）：`,
+        ...summaryLines,
+        "请直接读取附件中的源码内容继续。"
+      ].join("\n");
+
+      return { text, fallbackText, files: attachFiles };
+    }
+
+    if (action.kind === "exec") {
+      const stdout = (data.stdout || "").trim();
+      const stderr = (data.stderr || "").trim();
+      const rawTotal = stdout.length + stderr.length;
+      const shouldAttach =
+        rawTotal > 0 && (transferMode === "always_attach" || rawTotal > threshold);
+
+      if (!shouldAttach) {
+        return { text: fallbackText, fallbackText, files: [] };
+      }
+
+      const fileName = `wsl-cmd-${makeTimeStampTag()}.txt`;
+      const parts = [
+        `# WSL Command Output`,
+        `Command: ${action.payload.command}`,
+        `Exit Code: ${data.returncode} (${data.durationMs}ms)`
+      ];
+      if (stdout) parts.push(`\n=== STDOUT ===\n${stdout}`);
+      if (stderr) parts.push(`\n=== STDERR ===\n${stderr}`);
+      let content = parts.join("\n");
+      if (content.length > MAX_ATTACH_BUNDLE_CHARS) {
+        content = content.slice(0, MAX_ATTACH_BUNDLE_CHARS) + "\n... [命令输出超出附件上限已截断]";
+      }
+      const lineCount = (stdout ? stdout.split(/\r?\n/).length : 0) + (stderr ? stderr.split(/\r?\n/).length : 0);
+      const summary = [
+        `[WSL 命令执行结果]`,
+        `命令: \`${action.payload.command}\``,
+        `退出码: ${data.returncode} (${data.durationMs}ms)`,
+        `输出较长（约 ${lineCount} 行 / ${formatByteSize(content.length)}），完整内容已通过附件 \`${fileName}\` 上传。`
+      ].join("\n");
+
+      return {
+        text: summary,
+        fallbackText,
+        files: [{ name: fileName, content, mimeType: "text/plain" }]
+      };
+    }
+
+    // write / patch: keep compact diff inline, auto-upgrade large diff to attachment
+    const diffText = (data.diff || "").trim();
+    const shouldAttachDiff =
+      diffText.length > 0 && (transferMode === "always_attach" || diffText.length > threshold);
+    if (!shouldAttachDiff) {
+      return { text: fallbackText, fallbackText, files: [] };
+    }
+
+    const diffFileName = `wsl-${action.kind}-diff-${makeTimeStampTag()}.txt`;
+    const head =
+      action.kind === "write"
+        ? `[WSL 文件写入完成] \`${data.path}\` (${data.bytesWritten} bytes)`
+        : `[WSL 补丁已应用] ${data.path || data.mode}${data.matchMode === "tolerant-line" ? " (行级宽松匹配)" : ""}`;
+    const summary = `${head}\n变更 Diff 较长（${formatByteSize(diffText.length)}），已通过附件 \`${diffFileName}\` 上传。`;
+    return {
+      text: summary,
+      fallbackText,
+      files: [{ name: diffFileName, content: diffText, mimeType: "text/plain" }]
+    };
   }
 
   function findTurnContainer(el) {
@@ -712,7 +1156,7 @@
     outputPre.style.display = "none";
     card.appendChild(outputPre);
 
-    let lastFormattedResult = "";
+    let lastChatPayload = null;
     let currentUndoId = "";
 
     undoBtn.addEventListener("click", async () => {
@@ -752,7 +1196,7 @@
 
       try {
         const data = await sendBridgeRequest("POST", endpointMap[action.kind], action.payload);
-        lastFormattedResult = formatResultForChat(action, data);
+        lastChatPayload = buildChatPayload(action, data, latestCfg);
 
         if (action.kind === "read") {
           const summaryLines = (data.files || []).map((f) => {
@@ -790,11 +1234,13 @@
         const shouldSendNow = wantAutoFill && !deferSend && remainingCount === 0;
 
         if (shouldSendNow) {
-          insertTextIntoChat(lastFormattedResult, true);
-          runBtn.textContent = isAuto ? "L2 已自动回填 ✓" : "已执行并发送 ✓";
+          const deliveryRes = await deliverPayloadToChat(lastChatPayload, true);
+          const viaAttach = deliveryRes && deliveryRes.attachedCount > 0 ? " (附件)" : "";
+          runBtn.textContent = isAuto ? `L2 已自动回填${viaAttach} ✓` : `已执行并发送${viaAttach} ✓`;
         } else if (wantAutoFill && remainingCount > 0) {
-          insertTextIntoChat(lastFormattedResult, false);
-          runBtn.textContent = `已暂存 (还剩 ${remainingCount} 项) ✓`;
+          const deliveryRes = await deliverPayloadToChat(lastChatPayload, false);
+          const viaAttach = deliveryRes && deliveryRes.attachedCount > 0 ? "附件" : "文本";
+          runBtn.textContent = `已暂存${viaAttach} (还剩 ${remainingCount} 项) ✓`;
         } else {
           runBtn.textContent = "重新执行";
         }
@@ -804,7 +1250,8 @@
       } catch (err) {
         outputPre.classList.add("wslb-output-error");
         outputPre.textContent = `执行失败: ${err.message}`;
-        lastFormattedResult = `[WSL 操作失败] ${action.label} (${action.summary})\n错误: ${err.message}`;
+        const errText = `[WSL 操作失败] ${action.label} (${action.summary})\n错误: ${err.message}`;
+        lastChatPayload = { text: errText, fallbackText: errText, files: [] };
         runBtn.textContent = "重试";
         runBtn.disabled = false;
         insertBtn.style.display = "inline-flex";
@@ -820,10 +1267,14 @@
       executeAction({ isAuto: false });
     });
 
-    insertBtn.addEventListener("click", () => {
-      if (!lastFormattedResult) return;
-      const res = insertTextIntoChat(lastFormattedResult, false);
-      insertBtn.textContent = res.inserted ? "已回填 ✓" : "已复制 ✓";
+    insertBtn.addEventListener("click", async () => {
+      if (!lastChatPayload) return;
+      const res = await deliverPayloadToChat(lastChatPayload, false);
+      if (res && res.attachedCount > 0) {
+        insertBtn.textContent = "已挂载附件 ✓";
+      } else {
+        insertBtn.textContent = res && res.inserted ? "已回填 ✓" : "已复制 ✓";
+      }
       setTimeout(() => {
         insertBtn.textContent = "回填结果到输入框";
       }, 1800);
